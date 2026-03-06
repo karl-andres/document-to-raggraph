@@ -230,7 +230,6 @@ class OCREngine:
                 f"Mistral OCR extraction successful — {len(extracted_text)} chars extracted"
             )
 
-            print("Mistral Used")
             return {
                 "text": extracted_text,
                 "confidence": 1.0,  # Mistral OCR; confidence is implicit
