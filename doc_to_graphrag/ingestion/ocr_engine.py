@@ -1,4 +1,8 @@
-"""OCR engine for scanned documents using pytesseract."""
+"""OCR engine for scanned documents using pytesseract with VLM fallback."""
+
+import base64
+import io
+import os
 
 import pytesseract
 from PIL import Image, ImageFilter, ImageOps
@@ -10,7 +14,12 @@ logger = logging.getLogger(__name__)
 
 
 class OCREngine:
-    """OCR engine for extracting text from scanned documents and images."""
+    """OCR engine for extracting text from scanned documents and images.
+
+    If pytesseract confidence falls below `min_confidence`, the image is
+    automatically sent to Mistral OCR 3 via `process_with_ai` for
+    higher-quality extraction (handwriting, complex layouts, etc.).
+    """
 
     def __init__(self, min_confidence: float = 0.6, lang: str = "eng"):
         """
@@ -18,7 +27,7 @@ class OCREngine:
 
         Args:
             min_confidence: Minimum confidence threshold (0.0–1.0).
-                            Pages below this are flagged as low quality.
+                            Pages below this are routed to VLM fallback.
             lang: Tesseract language code (default: English)
         """
         self.min_confidence = min_confidence
@@ -32,11 +41,14 @@ class OCREngine:
         """
         Extract text from an image using Tesseract OCR.
 
+        If the average word-level confidence is below `min_confidence`,
+        the original image is forwarded to `process_with_ai` instead.
+
         Args:
             image_input: File path (str/Path) or a PIL Image object
 
         Returns:
-            {"text": str, "confidence": float}
+            {"text": str, "confidence": float, "ai_extracted": bool}
             confidence is 0.0–1.0 (average word-level confidence)
         """
         try:
@@ -45,7 +57,10 @@ class OCREngine:
             else:
                 image = image_input
 
-            # Optional preprocessing for better OCR quality
+            # Keep original for potential VLM fallback (before grayscale)
+            original_image = image.copy()
+
+            # Preprocessing for better OCR quality
             image = self.preprocess_image(image)
 
             # Get word-level data with confidence scores
@@ -65,17 +80,26 @@ class OCREngine:
                 else 0.0
             )
 
+            # If confidence is below threshold, fallback to VLM
+            if avg_confidence < self.min_confidence:
+                logger.info(
+                    f"OCR confidence {avg_confidence:.2%} is below "
+                    f"threshold {self.min_confidence:.2%} — falling back to AI extraction"
+                )
+                return self.process_with_ai(original_image)
+
             # Full text extraction (cleaner than reconstructing from data dict)
             text = pytesseract.image_to_string(image, lang=self.lang)
 
             return {
                 "text": text.strip(),
                 "confidence": round(avg_confidence, 4),
+                "ai_extracted": False,
             }
 
         except Exception as e:
             logger.error(f"OCR extraction failed: {e}")
-            return {"text": "", "confidence": 0.0}
+            return {"text": "", "confidence": 0.0, "ai_extracted": False}
 
     # ------------------------------------------------------------------ #
     #  PDF → images → OCR                                                 #
@@ -117,6 +141,7 @@ class OCREngine:
                 "page": i + 1,
                 "text": result["text"],
                 "confidence": result["confidence"],
+                "ai_extracted": result.get("ai_extracted", False),
             })
             if result["text"]:
                 all_texts.append(result["text"])
@@ -136,6 +161,85 @@ class OCREngine:
             "page_count": len(images),
             "per_page": per_page,
         }
+
+    # ------------------------------------------------------------------ #
+    #  AI-powered extraction (Mistral OCR fallback)                        #
+    # ------------------------------------------------------------------ #
+
+    def process_with_ai(self, image: Image.Image) -> Dict[str, Any]:
+        """
+        Send an image to Mistral OCR 3 for high-quality text extraction.
+
+        Used as a fallback when pytesseract confidence is below the
+        minimum threshold — e.g. handwritten text, degraded scans,
+        complex layouts that trip up traditional OCR.
+
+        Mistral OCR 3 is purpose-built for document extraction and
+        preserves table structure (HTML with colspan), reading order,
+        and handles handwriting natively. Cost: ~$2 / 1,000 pages.
+
+        Requires MISTRAL_API_KEY in environment variables.
+
+        Args:
+            image: PIL Image (original, pre-preprocessing)
+
+        Returns:
+            {"text": str, "confidence": float, "ai_extracted": True}
+        """
+        try:
+            from mistralai import Mistral
+        except ImportError:
+            raise ImportError(
+                "mistralai is required for AI-based text extraction. "
+                "Install it with: pip install mistralai"
+            )
+
+        api_key = os.getenv("MISTRAL_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "MISTRAL_API_KEY environment variable is not set. "
+                "Get your key at https://console.mistral.ai/"
+            )
+
+        # Encode image to base64 PNG
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        b64_image = base64.b64encode(buf.getvalue()).decode("utf-8")
+        image_data_url = f"data:image/png;base64,{b64_image}"
+
+        client = Mistral(api_key=api_key)
+
+        try:
+            ocr_response = client.ocr.process(
+                model="mistral-ocr-latest",
+                document={
+                    "type": "image_url",
+                    "image_url": image_data_url,
+                },
+            )
+
+            # Combine all pages/sections of the OCR result into text
+            extracted_parts = []
+            for page in ocr_response.pages:
+                if page.markdown:
+                    extracted_parts.append(page.markdown)
+
+            extracted_text = "\n\n".join(extracted_parts).strip()
+
+            logger.info(
+                f"Mistral OCR extraction successful — {len(extracted_text)} chars extracted"
+            )
+
+            print("Mistral Used")
+            return {
+                "text": extracted_text,
+                "confidence": 1.0,  # Mistral OCR; confidence is implicit
+                "ai_extracted": True,
+            }
+
+        except Exception as e:
+            logger.error(f"Mistral OCR extraction failed: {e}")
+            return {"text": "", "confidence": 0.0, "ai_extracted": True}
 
     # ------------------------------------------------------------------ #
     #  Image preprocessing                                                #
