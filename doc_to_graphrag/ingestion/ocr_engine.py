@@ -1,14 +1,22 @@
-"""OCR engine for scanned documents using pytesseract with VLM fallback."""
+"""OCR engine for scanned documents using pytesseract with Azure-hosted Mistral OCR fallback.
+
+This implementation mirrors the provided curl examples by:
+- Encoding PDFs/images as base64 data URLs
+- Calling the Azure-hosted Mistral OCR endpoint via HTTP
+- Using AZURE_API_KEY for authentication
+"""
 
 import base64
 import io
+import json
 import os
+import logging
+from pathlib import Path
+from typing import Dict, Any, Union, List, Literal, Optional
+from urllib import request as http_request, error as http_error
 
 import pytesseract
 from PIL import Image, ImageFilter, ImageOps
-from pathlib import Path
-from typing import Dict, Any, Union, List, Literal, Optional
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -16,14 +24,13 @@ OcrMode = Literal["tesseract", "mistral", "hybrid"]
 TableFormat = Literal["markdown", "html"]  # None means inline/inline markdown
 
 
-
 class OCREngine:
     """OCR engine for extracting text from scanned documents and images.
 
     Supports three modes:
-    - tesseract: Pytesseract only; never call Mistral.
-    - mistral: Always use Mistral OCR API (PDF upload or image base64).
-    - hybrid: Tesseract first; if confidence < min_confidence, fallback to Mistral.
+    - tesseract: Pytesseract only; never call Azure OCR.
+    - mistral: Always use Azure-hosted Mistral OCR endpoint (PDF or image).
+    - hybrid: Tesseract first; if confidence < min_confidence, fallback to Azure OCR.
     """
 
     def __init__(
@@ -36,22 +43,24 @@ class OCREngine:
         extract_header: bool = False,
         extract_footer: bool = False,
         include_image_base64: bool = False,
-        mistral_client=None,
+        # Backwards-compat: accept but ignore legacy mistral_client argument
+        mistral_client: Optional[Any] = None,
     ):
         """
         Initialize OCR engine.
 
         Args:
-            mode: "tesseract" | "mistral" | "hybrid". Hybrid uses Mistral when
+            mode: "tesseract" | "mistral" | "hybrid". Hybrid uses Azure OCR when
                   Tesseract confidence is below min_confidence.
             min_confidence: Minimum confidence threshold (0.0–1.0) for hybrid mode.
             lang: Tesseract language code (default: English).
-            table_format: Mistral OCR table output: "markdown" | "html" | None.
-            extract_header: Mistral: extract header into separate field.
-            extract_footer: Mistral: extract footer into separate field.
-            include_image_base64: Mistral: include extracted images as base64.
-            mistral_client: Pre-initialized Mistral client. If None, one will be
-                            created from MISTRAL_API_KEY when first needed.
+            table_format: OCR table output: "markdown" | "html" | None.
+            extract_header: Azure OCR: extract header into separate field.
+            extract_footer: Azure OCR: extract footer into separate field.
+            include_image_base64: Azure OCR: include extracted images as base64.
+            mistral_client: legacy parameter from previous Mistral SDK-based
+                            implementation; accepted for backwards compatibility
+                            but ignored when using the Azure HTTP endpoint.
         """
         self.mode = mode
         self.min_confidence = min_confidence
@@ -60,10 +69,16 @@ class OCREngine:
         self.extract_header = extract_header
         self.extract_footer = extract_footer
         self.include_image_base64 = include_image_base64
-        self._mistral_client = mistral_client
+        # Store but do not use the legacy client to avoid TypeError in
+        # existing code that still passes this argument.
+        self._legacy_mistral_client = mistral_client
+
+        # Azure-hosted Mistral OCR endpoint + config
+        self.azure_endpoint = os.environ.get("AZURE_MISTRAL_OCR_ENDPOINT")
+        self.azure_model = os.getenv("AZURE_MISTRAL_OCR_MODEL", "mistral-wizonix-ocr")
 
     def _mistral_ocr_kwargs(self) -> Dict[str, Any]:
-        """Build kwargs for client.ocr.process from instance options."""
+        """Build kwargs for Azure-hosted Mistral OCR from instance options."""
         kwargs: Dict[str, Any] = {}
         if self.table_format is not None:
             kwargs["table_format"] = self.table_format
@@ -75,24 +90,51 @@ class OCREngine:
             kwargs["include_image_base64"] = True
         return kwargs
 
-    def _get_mistral_client(self):
-        """Return the Mistral client, creating one from env if not injected."""
-        if self._mistral_client is not None:
-            return self._mistral_client
-        try:
-            from mistralai import Mistral
-        except ImportError:
-            raise ImportError(
-                "mistralai is required for AI-based OCR. pip install mistralai"
-            )
-        api_key = os.getenv("MISTRAL_API_KEY")
+    def _call_azure_ocr(self, *, document_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Call the Azure-hosted Mistral OCR endpoint using the same payload
+        structure as the curl examples.
+
+        Requires AZURE_API_KEY in the environment.
+        """
+        api_key = os.getenv("AZURE_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "MISTRAL_API_KEY environment variable is not set. "
-                "Get your key at https://console.mistral.ai/"
+                "AZURE_API_KEY environment variable is not set. "
+                "Set it to your Azure Mistral OCR API key."
             )
-        self._mistral_client = Mistral(api_key=api_key)
-        return self._mistral_client
+
+        body = {
+            "model": self.azure_model,
+            "document": document_payload,
+            **self._mistral_ocr_kwargs(),
+        }
+        data = json.dumps(body).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+
+        req = http_request.Request(
+            self.azure_endpoint,
+            data=data,
+            headers=headers,
+            method="POST",
+        )
+
+        try:
+            with http_request.urlopen(req) as resp:
+                resp_body = resp.read().decode("utf-8")
+                return json.loads(resp_body)
+        except http_error.HTTPError as e:
+            logger.error(f"Azure Mistral OCR HTTP error: {e.status} {e.reason}")
+            raise
+        except http_error.URLError as e:
+            logger.error(f"Azure Mistral OCR URL error: {e.reason}")
+            raise
+        except Exception as e:
+            logger.error(f"Azure Mistral OCR request failed: {e}")
+            raise
 
     # ------------------------------------------------------------------ #
     #  Core: extract from a single image                                  #
@@ -104,8 +146,8 @@ class OCREngine:
         """
         Extract text from an image. Behavior depends on mode:
         - tesseract: Pytesseract only.
-        - mistral: Always Mistral OCR (skip Tesseract).
-        - hybrid: Tesseract first; fallback to Mistral if confidence < min_confidence.
+        - mistral: Always Azure OCR (skip Tesseract).
+        - hybrid: Tesseract first; fallback to Azure OCR if confidence < min_confidence.
 
         Args:
             image_input: File path (str/Path) or a PIL Image object
@@ -158,11 +200,11 @@ class OCREngine:
                     "ai_extracted": False,
                 }
 
-            # Hybrid: fallback to Mistral if below threshold
+            # Hybrid: fallback to Azure OCR if below threshold
             if avg_confidence < self.min_confidence:
                 logger.info(
                     f"OCR confidence {avg_confidence:.2%} is below "
-                    f"threshold {self.min_confidence:.2%} — falling back to AI extraction"
+                    f"threshold {self.min_confidence:.2%} — falling back to Azure OCR"
                 )
                 return self.process_with_ai(original_image)
 
@@ -194,20 +236,10 @@ class OCREngine:
         """
         Extract text from a PDF.
 
-        When mode is "mistral" or force_ai is True, the entire PDF is uploaded
-        to Mistral OCR in a single API call. Otherwise each page is processed
-        via extract_from_image (Tesseract and/or Mistral per page depending on mode).
-
-        Args:
-            file_path:  Path to the PDF file
-            force_ai:   When in hybrid mode, skip Tesseract and use Mistral for
-                        the whole document. Ignored when mode is tesseract or mistral.
-            mode:      Override instance mode for this call.
-            dpi:        Resolution for pdf2image (only when not using Mistral for whole doc)
-
-        Returns:
-            {"text": str, "confidence": float, "page_count": int,
-             "mistral_ocr_response": ..., "ai_extracted": bool}
+        When mode is "mistral" or force_ai is True, the entire PDF is sent
+        to Azure-hosted Mistral OCR in a single API call. Otherwise each page
+        is processed via extract_from_image (Tesseract and/or Azure OCR per
+        page depending on mode).
         """
         use_mode = mode if mode is not None else self.mode
         use_mistral_whole = use_mode == "mistral" or force_ai
@@ -266,60 +298,53 @@ class OCREngine:
         }
 
     # ------------------------------------------------------------------ #
-    #  Direct PDF upload to Mistral OCR                                    #
+    #  Direct PDF upload to Azure OCR                                     #
     # ------------------------------------------------------------------ #
 
     def process_pdf_with_ai(self, file_path: str) -> Dict[str, Any]:
         """
-        Upload an entire PDF to Mistral OCR in a single API call.
+        Send an entire PDF to Azure-hosted Mistral OCR in a single API call.
 
-        This is **much** faster than per-page processing — Mistral can
-        handle up to 1 000 pages / 50 MB and processes ~2 000 pages/min.
-
-        Workflow:
-            1. Upload the PDF to Mistral file storage
-            2. Obtain a signed URL for the uploaded file
-            3. Call ``client.ocr.process`` with the signed URL
-
-        Args:
-            file_path: Path to the PDF file
-
-        Returns:
-            {"text": str, "mistral_ocr_response": OCRResponse,
-             "confidence": 1.0, "ai_extracted": True,
-             "page_count": int}
+        This mirrors the curl example using a base64-encoded data URL.
         """
-        client = self._get_mistral_client()
+        try:
+            with open(file_path, "rb") as f:
+                raw = f.read()
+        except Exception as e:
+            logger.error(f"Failed to read PDF for OCR: {e}")
+            return {
+                "text": "",
+                "mistral_ocr_response": None,
+                "confidence": 0.0,
+                "ai_extracted": True,
+                "page_count": 0,
+            }
+
+        b64_pdf = base64.b64encode(raw).decode("utf-8")
+        data_url = f"data:application/pdf;base64,{b64_pdf}"
 
         try:
-            # 1. Upload the PDF to Mistral's file storage
-            with open(file_path, "rb") as f:
-                uploaded = client.files.upload(
-                    file={"file_name": Path(file_path).name, "content": f},
-                    purpose="ocr",
-                )
-
-            # 2. Get a signed URL for the uploaded file
-            signed_url = client.files.get_signed_url(file_id=uploaded.id)
-
-            # 3. Process the entire PDF in one call
-            ocr_response = client.ocr.process(
-                model="mistral-ocr-latest",
-                document={
+            ocr_response = self._call_azure_ocr(
+                document_payload={
                     "type": "document_url",
-                    "document_url": signed_url.url,
-                },
-                **self._mistral_ocr_kwargs(),
+                    "document_url": data_url,
+                }
             )
 
-            # Combine all pages into a single text
-            pages_text = [p.markdown for p in ocr_response.pages if p.markdown]
+            pages = ocr_response.get("pages", []) or []
+            pages_text = [
+                (p.get("markdown") or p.get("text") or "").strip() for p in pages
+            ]
+            pages_text = [t for t in pages_text if t]
             extracted_text = "\n\n".join(pages_text).strip()
+            page_count = (
+                ocr_response.get("usage_info", {}).get("pages_processed")
+                or len(pages)
+            )
 
             logger.info(
-                f"Mistral OCR (PDF upload) successful — "
-                f"{len(ocr_response.pages)} pages, "
-                f"{len(extracted_text)} chars extracted"
+                f"Azure Mistral OCR (PDF) successful — "
+                f"{page_count} pages, {len(extracted_text)} chars extracted"
             )
 
             return {
@@ -327,11 +352,11 @@ class OCREngine:
                 "mistral_ocr_response": ocr_response,
                 "confidence": 1.0,
                 "ai_extracted": True,
-                "page_count": len(ocr_response.pages),
+                "page_count": page_count,
             }
 
         except Exception as e:
-            logger.error(f"Mistral OCR (PDF upload) failed: {e}")
+            logger.error(f"Azure Mistral OCR (PDF) failed: {e}")
             return {
                 "text": "",
                 "mistral_ocr_response": None,
@@ -341,31 +366,15 @@ class OCREngine:
             }
 
     # ------------------------------------------------------------------ #
-    #  AI-powered extraction (Mistral OCR fallback)                        #
+    #  AI-powered extraction (Azure OCR fallback)                         #
     # ------------------------------------------------------------------ #
 
     def process_with_ai(self, image: Image.Image) -> Dict[str, Any]:
         """
-        Send an image to Mistral OCR 3 for high-quality text extraction.
+        Send an image to Azure-hosted Mistral OCR for high-quality text extraction.
 
-        Used as a fallback when pytesseract confidence is below the
-        minimum threshold — e.g. handwritten text, degraded scans,
-        complex layouts that trip up traditional OCR.
-
-        Mistral OCR 3 is purpose-built for document extraction and
-        preserves table structure (HTML with colspan), reading order,
-        and handles handwriting natively. Cost: ~$2 / 1,000 pages.
-
-        Requires MISTRAL_API_KEY in environment variables.
-
-        Args:
-            image: PIL Image (original, pre-preprocessing)
-
-        Returns:
-            {"text": str, "confidence": float, "ai_extracted": True}
+        This mirrors the curl example using a base64-encoded image data URL.
         """
-        client = self._get_mistral_client()
-
         # Encode image to base64 PNG
         buf = io.BytesIO()
         image.save(buf, format="PNG")
@@ -373,40 +382,44 @@ class OCREngine:
         image_data_url = f"data:image/png;base64,{b64_image}"
 
         try:
-            ocr_response = client.ocr.process(
-                model="mistral-ocr-latest",
-                document={
+            ocr_response = self._call_azure_ocr(
+                document_payload={
                     "type": "image_url",
                     "image_url": image_data_url,
-                },
-                **self._mistral_ocr_kwargs(),
+                }
             )
 
-            # Combine all pages/sections of the OCR result into text
-            extracted_parts = []
-            for page in ocr_response.pages:
-                if page.markdown:
-                    extracted_parts.append(page.markdown)
+            pages = ocr_response.get("pages", []) or []
+            extracted_parts: List[str] = []
+            for page in pages:
+                md = (page.get("markdown") or page.get("text") or "").strip()
+                if md:
+                    extracted_parts.append(md)
 
             extracted_text = "\n\n".join(extracted_parts).strip()
 
             logger.info(
-                f"Mistral OCR extraction successful — {len(extracted_text)} chars extracted"
+                f"Azure Mistral OCR (image) successful — {len(extracted_text)} chars extracted"
             )
 
             return {
                 "text": extracted_text,
                 "mistral_ocr_response": ocr_response,
-                "confidence": 1.0,  # Mistral OCR; confidence is implicit
+                "confidence": 1.0,  # AI OCR; confidence treated as max
                 "ai_extracted": True,
             }
 
         except Exception as e:
-            logger.error(f"Mistral OCR extraction failed: {e}")
-            return {"text": "", "mistral_ocr_response": None, "confidence": 0.0, "ai_extracted": True}
+            logger.error(f"Azure Mistral OCR (image) failed: {e}")
+            return {
+                "text": "",
+                "mistral_ocr_response": None,
+                "confidence": 0.0,
+                "ai_extracted": True,
+            }
 
     # ------------------------------------------------------------------ #
-    #  Mistral Batch OCR (Mistral-only)                                   #
+    #  Mistral Batch OCR (not supported with Azure endpoint)             #
     # ------------------------------------------------------------------ #
 
     def process_batch_mistral(
@@ -414,72 +427,12 @@ class OCREngine:
         file_paths: List[Union[str, Path]],
     ) -> str:
         """
-        Submit multiple documents to Mistral Batch Inference API and return the job ID.
-
-        Only valid when mode is "mistral". Supports PDF and image files.
-        Use the returned job ID to check status and retrieve results later.
+        Batch OCR is not supported when using the Azure curl-based endpoint.
         """
-        if self.mode != "mistral":
-            raise ValueError(
-                "Batch processing is only supported when ocr_mode is 'mistral'. "
-                f"Current mode is '{self.mode}'."
-            )
-
-        import json
-        import tempfile
-
-        client = self._get_mistral_client()
-        path_list = [Path(p) for p in file_paths]
-        ocr_bodies: List[Dict[str, Any]] = []
-
-        for path in path_list:
-            if not path.exists():
-                raise FileNotFoundError(f"File not found: {path}")
-            suffix = path.suffix.lower()
-            body: Dict[str, Any] = {**self._mistral_ocr_kwargs()}
-            if suffix == ".pdf":
-                with open(path, "rb") as f:
-                    uploaded = client.files.upload(
-                        file={"file_name": path.name, "content": f},
-                        purpose="ocr",
-                    )
-                signed_url = client.files.get_signed_url(file_id=uploaded.id)
-                body["document"] = {"document_url": signed_url.url}
-            else:
-                with open(path, "rb") as f:
-                    raw = f.read()
-                b64 = base64.b64encode(raw).decode("utf-8")
-                mime = "image/png" if suffix == ".png" else "image/jpeg"
-                body["document"] = {"image_url": f"data:{mime};base64,{b64}"}
-            ocr_bodies.append(body)
-
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
-        ) as tmp:
-            for idx, body in enumerate(ocr_bodies):
-                line = json.dumps({"custom_id": str(idx), "body": body}) + "\n"
-                tmp.write(line)
-            jsonl_path = tmp.name
-
-        try:
-            with open(jsonl_path, "rb") as f:
-                batch_file = client.files.upload(
-                    file={"file_name": "ocr_batch.jsonl", "content": f},
-                    purpose="batch",
-                )
-            job = client.batch.jobs.create(
-                input_files=[batch_file.id],
-                model="mistral-ocr-latest",
-                endpoint="/v1/ocr",
-            )
-        finally:
-            try:
-                os.unlink(jsonl_path)
-            except OSError:
-                pass
-
-        logger.info(f"Mistral batch job submitted — job_id={job.id}")
-        return job.id
+        raise NotImplementedError(
+            "Batch OCR is not supported with the Azure Mistral OCR endpoint. "
+            "Call extract_from_pdf/extract_from_image in a loop instead."
+        )
 
     # ------------------------------------------------------------------ #
     #  Image preprocessing                                                #
@@ -507,3 +460,4 @@ class OCREngine:
         image = image.filter(ImageFilter.SHARPEN)
 
         return image
+
